@@ -1,425 +1,331 @@
+
 """
-scrape_courses.py
+broad_many_to_many_scraper.py
 
-Single-run scraper for course data across multiple platforms using SerpAPI + BeautifulSoup.
-Outputs: courses_data.xlsx (one sheet with all courses)
+Restorative "high-yield" scraper:
+- Searches all (platform, category) pairs (4 platforms x 6 categories = 24 SerpAPI searches).
+- For each SerpAPI result, if it's a listing page, we extract multiple course links from that listing.
+- Parsers are lenient: prefer JSON-LD, otherwise H1/meta/first large paragraph + lists.
+- Output file: courses_data.xlsx (same folder); fallback timestamped file if Excel is open.
 
-Notes:
-- Configure MAX_URLS_PER_SEARCH to control how many SerpAPI results per category to fetch.
-- Configure MAX_COURSES_FROM_LISTING to limit number of courses parsed from a listing page.
-- Each SerpAPI search consumes 1 query from your SerpAPI quota.
+Requirements:
+pip install requests beautifulsoup4 pandas openpyxl
 """
 
-import os
-import time
-import requests
+import requests, time, json, os
 from bs4 import BeautifulSoup
 import pandas as pd
 from urllib.parse import urlparse, urljoin
+from datetime import datetime
 
 # ---------------- CONFIG ----------------
-SERPAPI_KEY = "b0eb9ae6d942cc5089ac78f69b93d1e812aad54bed266fadffafb702c6979d50"
-
-COURSE_CATEGORIES = [
+API_KEY = "b0eb9ae6d942cc5089ac78f69b93d1e812aad54bed266fadffafb702c6979d50"    # <<-- put your real key here
+PLATFORMS = ["coursera.org", "edx.org", "pluralsight.com", "freecodecamp.org"]
+PLATFORM_NAME_MAP = {
+    "coursera.org": "Coursera",
+    "edx.org": "edX",
+    "pluralsight.com": "Pluralsight",
+    "freecodecamp.org": "FreeCodeCamp"
+}
+CATEGORIES = [
     "AI/ML course",
     "Full stack development course",
     "Data science course",
     "Cyber security course",
-    "Advanced Python course",
+    "Advanced python course",
     "Database management course"
 ]
 
-PLATFORMS = [
-    "coursera.org",
-    "edx.org",
-    "udemy.com",
-    "pluralsight.com",
-    "khanacademy.org",
-    "freecodecamp.org"
-]
-
-# how many SerpAPI results to use per category (keeps SerpAPI usage low)
-MAX_URLS_PER_SEARCH = 10
-
-# when a search result is a listing page, limit number of extracted course links per listing
-MAX_COURSES_FROM_LISTING = 8
-
-# polite delay between requests (seconds)
-PAGE_REQUEST_DELAY = 1.5
-
-# output filename
+MAX_URLS_PER_SEARCH = 5           # SerpAPI results per (platform, category)
+MAX_COURSES_FROM_LISTING = 8      # how many course links to scrape from a listing page
+PAGE_REQUEST_DELAY = 1.2
+SERPAPI_DELAY = 0.8
+REQUEST_TIMEOUT = 12
 OUTPUT_XLSX = "courses_data.xlsx"
 
 # ---------------- UTILITIES ----------------
 
-def serpapi_search(query, num_results=10):
-    """Call SerpAPI search.json and return organic result URLs."""
+def serpapi_search(query, num_results=5):
     base = "https://serpapi.com/search.json"
-    params = {
-        "q": query,
-        "engine": "google",
-        "num": num_results,
-        "api_key": SERPAPI_KEY
-    }
-    r = requests.get(base, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    urls = []
-    for res in data.get("organic_results", []):
-        link = res.get("link")
-        if link:
-            urls.append(link)
-    return urls
+    params = {"engine":"google","q":query,"num":num_results,"api_key":API_KEY}
+    try:
+        r = requests.get(base, params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("organic_results", [])
+    except Exception as e:
+        print("SerpAPI error:", e)
+        return []
 
 def get_soup(url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    r = requests.get(url, headers=headers, timeout=12)
+    headers = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
-def short_text(text, max_len=300):
-    if not text:
-        return "Not available"
-    text = ' '.join(text.split())
-    return text if len(text) <= max_len else text[:max_len].rsplit(' ', 1)[0] + "..."
+def short_text(text, max_len=400):
+    if not text: return ""
+    s = " ".join(text.split())
+    return s if len(s)<=max_len else s[:max_len].rsplit(" ",1)[0]+"..."
 
-# ---------------- PLATFORM-SPECIFIC PARSERS ----------------
-# These parsers attempt to extract the requested fields. They are heuristics;
-# some sites have complex JS rendering — if a field is not found, "Not available" is used.
+def remove_scripts(soup):
+    for t in soup(["script","style","noscript"]):
+        t.decompose()
 
-def parse_common_meta(soup):
-    """Try to extract common metadata-like fields from meta tags."""
-    meta = {}
-    # Course name
-    title = None
-    if soup.title and soup.title.string:
-        title = soup.title.string
-    og_title = soup.find('meta', property='og:title')
-    if og_title and og_title.get('content'):
-        title = og_title['content']
-    meta['course_name'] = short_text(title or "Not available", 200)
+def parse_jsonld_course(soup):
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            txt = script.string
+            if not txt:
+                continue
+            data = json.loads(txt)
+        except Exception:
+            try:
+                data = json.loads(script.get_text())
+            except Exception:
+                continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            if isinstance(it, dict):
+                if "Course" in str(it.get("@type","")) or it.get("name") and it.get("description"):
+                    return it
+                graph = it.get("@graph")
+                if graph and isinstance(graph, list):
+                    for g in graph:
+                        if isinstance(g, dict) and ("Course" in str(g.get("@type","")) or (g.get("name") and g.get("description"))):
+                            return g
+    return None
 
-    # description
-    desc = None
-    desc_tag = soup.find('meta', attrs={'name': 'description'}) or soup.find('meta', property='og:description')
-    if desc_tag and desc_tag.get('content'):
-        desc = desc_tag['content']
-    meta['short_description'] = short_text(desc or "Not available", 300)
+# Heuristic: treat as listing if many course-like anchors or URL contains /courses /learn /catalog /browse /search /topic /specialization
+def is_listing_page(url, soup):
+    path = urlparse(url).path.lower()
+    title = (soup.title.string or "").lower() if soup.title else ""
+    if any(k in path for k in ["/courses","/learn","/browse","/catalog","/topic","/specialization","/search","/discover"]):
+        return True
+    # count anchor hints
+    count = 0
+    for a in soup.find_all("a", href=True)[:200]:
+        href = a['href'].lower()
+        text = (a.get_text() or "").lower()
+        if any(w in href for w in ["course","learn","certificate","program","specialization","path","bootcamp"]) or any(w in text for w in ["course","learn","certificate","specialization","program","path"]):
+            count += 1
+    return count >= 6
 
-    return meta
-
-def parse_coursera(url, soup):
-    # heuristics for coursera
-    meta = parse_common_meta(soup)
-    meta['platform'] = "Coursera"
-    meta['url'] = url
-
-    # duration
-    dur = soup.find(lambda tag: tag.name in ["span","div"] and "hours" in (tag.get_text() or "").lower())
-    meta['duration'] = short_text(dur.get_text() if dur else "Not available")
-
-    # rating
-    rating = soup.find('span', attrs={'data-test': 'rating-text'})
-    if not rating:
-        rating = soup.find('div', class_='Hk4XNb')  # backup class pattern
-    meta['rating'] = short_text(rating.get_text() if rating else "Not available")
-
-    # skill level
-    level = soup.find(string=lambda t: t and any(x in t.lower() for x in ["beginner", "intermediate", "advanced"]))
-    meta['skill_level'] = short_text(level.strip() if level else "Not available")
-
-    # price - often Coursera shows "Free" or "Paid"
-    meta['price'] = "Not available"
-    price_tag = soup.find(string=lambda t: t and ("free" in t.lower() or "paid" in t.lower() or "$" in t))
-    if price_tag:
-        meta['price'] = short_text(price_tag.strip())
-
-    # skills covered - try to find syllabus or skills list
-    skills = []
-    for ul in soup.find_all('ul'):
-        if any('skill' in (li.get_text() or "").lower() for li in ul.find_all('li')[:5]):
-            skills = [li.get_text(strip=True) for li in ul.find_all('li')]
-            break
-    meta['skills_covered'] = ', '.join(skills) if skills else "Not available"
-
-    return meta
-
-def parse_udemy(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = "Udemy"
-    meta['url'] = url
-
-    # duration (Udemy often has 'Total length' or 'Last updated' labels)
-    dur = soup.find(string=lambda t: t and "total length" in t.lower())
-    if dur:
-        parent = dur.find_parent()
-        meta['duration'] = short_text(parent.get_text()) if parent else "Not available"
-    else:
-        # try alternative
-        dur_alt = soup.find('span', class_='ud-component--course-landing-page-udlite--curriculum-length')
-        meta['duration'] = short_text(dur_alt.get_text() if dur_alt else "Not available")
-
-    # rating
-    rating = soup.find('span', class_='udlite-heading-sm star-rating--rating-number--2o8YM')
-    if not rating:
-        rating = soup.find('span', attrs={'data-purpose': 'rating-number'})
-    meta['rating'] = short_text(rating.get_text() if rating else "Not available")
-
-    # skill level
-    level = soup.find(string=lambda t: t and any(x in t.lower() for x in ["beginner","all levels","intermediate","advanced"]))
-    meta['skill_level'] = short_text(level.strip() if level else "Not available")
-
-    # price
-    price = soup.find('div', class_='price-text--price-part--Tu6MH')
-    if not price:
-        price = soup.find(string=lambda t: t and ("free" in t.lower() or "$" in t))
-    meta['price'] = short_text(price.get_text() if price else "Not available")
-
-    # skills - Udemy often lists objectives; try to capture them
-    skills = []
-    for section in soup.find_all(['ul','ol']):
-        text = ' '.join(li.get_text() for li in section.find_all('li')[:8])
-        if len(text) > 30:
-            skills = [li.get_text(strip=True) for li in section.find_all('li')[:10]]
-            break
-    meta['skills_covered'] = ', '.join(skills) if skills else "Not available"
-
-    return meta
-
-def parse_edx(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = "edX"
-    meta['url'] = url
-
-    # duration
-    dur = soup.find(string=lambda t: t and ("weeks" in t.lower() or "hours" in t.lower()))
-    meta['duration'] = short_text(dur.strip() if dur else "Not available")
-
-    # rating (edX doesn't always show ratings on course pages)
-    meta['rating'] = "Not available"
-
-    # skill level
-    level = soup.find(string=lambda t: t and any(x in t.lower() for x in ["introductory","intermediate","advanced","beginner"]))
-    meta['skill_level'] = short_text(level.strip() if level else "Not available")
-
-    # price
-    price = soup.find(string=lambda t: t and ("verified" in t.lower() or "free" in t.lower() or "$" in t))
-    meta['price'] = short_text(price.strip() if price else "Not available")
-
-    # skills covered
-    skills = []
-    ul = soup.find('ul', class_='course-skills') or soup.find('ul', attrs={'aria-label': 'Skills'})
-    if ul:
-        skills = [li.get_text(strip=True) for li in ul.find_all('li')]
-    meta['skills_covered'] = ', '.join(skills) if skills else "Not available"
-
-    return meta
-
-def parse_pluralsight(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = "Pluralsight"
-    meta['url'] = url
-
-    meta['duration'] = short_text(soup.find(string=lambda t: t and "hours" in t.lower()) or "Not available")
-    meta['rating'] = "Not available"
-    meta['skill_level'] = short_text(soup.find(string=lambda t: t and any(x in t.lower() for x in ["beginner","intermediate","advanced"])) or "Not available")
-    meta['price'] = "Paid (Pluralsight subscription)"
-    meta['skills_covered'] = "Not available"
-    return meta
-
-def parse_khanacademy(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = "Khan Academy"
-    meta['url'] = url
-
-    meta['duration'] = "Not available"
-    meta['rating'] = "Free / Not rated"
-    meta['skill_level'] = "Not available"
-    meta['price'] = "Free"
-    meta['skills_covered'] = "Not available"
-    return meta
-
-def parse_freecodecamp(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = "FreeCodeCamp"
-    meta['url'] = url
-    meta['duration'] = "Not available"
-    meta['rating'] = "Free / Not rated"
-    meta['skill_level'] = "Not available"
-    meta['price'] = "Free"
-    meta['skills_covered'] = "Not available"
-    return meta
-
-def fallback_parser(url, soup):
-    meta = parse_common_meta(soup)
-    meta['platform'] = urlparse(url).netloc
-    meta['url'] = url
-    # best-effort: try to find duration/rating by keywords
-    meta['duration'] = short_text(soup.find(string=lambda t: t and ("hours" in t.lower() or "weeks" in t.lower())) or "Not available")
-    meta['rating'] = short_text(soup.find(string=lambda t: t and ("rating" in t.lower() or "stars" in t.lower())) or "Not available")
-    meta['skill_level'] = short_text(soup.find(string=lambda t: t and any(x in t.lower() for x in ["beginner","intermediate","advanced"])) or "Not available")
-    meta['price'] = short_text(soup.find(string=lambda t: t and ("free" in t.lower() or "$" in t or "paid" in t.lower())) or "Not available")
-    meta['skills_covered'] = "Not available"
-    return meta
-
-# ---------------- LINK EXTRACTION FROM LISTING PAGES ----------------
-
-def extract_course_links_from_listing(url, soup, domain):
-    """
-    From a listing/category page, attempt to extract multiple course page links.
-    Simple heuristics: find <a> tags with hrefs containing platform domain and keywords like 'course'
-    """
-    links = set()
-    for a in soup.find_all('a', href=True):
+def extract_links_from_listing(url, soup, platform_domain):
+    links = []
+    parsed_base = urlparse(url)
+    for a in soup.find_all("a", href=True):
         href = a['href']
-        # normalize
         if href.startswith("//"):
             href = "https:" + href
         if href.startswith("/"):
-            parsed = urlparse(url)
-            href = urljoin(f"{parsed.scheme}://{parsed.netloc}", href)
-        if domain in href and ('course' in href or 'learn' in href or 'certificate' in href or 'program' in href):
-            links.add(href.split('?')[0])
-        # also add if anchor text looks like a course
+            href = urljoin(f"{parsed_base.scheme}://{parsed_base.netloc}", href)
+        href = href.split("#")[0].split("?")[0]
+        if platform_domain in href and any(k in href.lower() for k in ["course","learn","program","specialization","certificate","path","bootcamp","courses"]):
+            if href not in links:
+                links.append(href)
+        # also accept anchors with course-like text even if href domain differs (rare)
         text = (a.get_text() or "").lower()
-        if domain in href or domain in text:
-            if any(k in text for k in ["course","program","specialization","path","certificate","bootcamp"]):
-                links.add(href.split('?')[0])
+        if platform_domain in href and any(t in text for t in ["course","learn","specialization","program"]):
+            if href not in links:
+                links.append(href)
         if len(links) >= MAX_COURSES_FROM_LISTING:
             break
-    return list(links)
+    return links
 
-# ---------------- MAIN SCRAPING LOGIC ----------------
+# Wide but safe extractor: prefer JSON-LD, else h1/meta/first long paragraph, plus reasonable "what you'll learn" lists
+def extract_course_info_lenient(url, soup, platform_domain):
+    remove_scripts(soup)
+    jsonld = parse_jsonld_course(soup)
+    title = description = skills = level = ""
+    if jsonld:
+        title = jsonld.get("name") or jsonld.get("headline") or ""
+        description = jsonld.get("description") or jsonld.get("summary") or ""
+        # skills try: about, learningOutcome, teaches, keywords
+        skills_list = []
+        for key in ("about","learningOutcome","teaches","keywords","skills"):
+            v = jsonld.get(key)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        skills_list.append(item.get("name") or item.get("headline") or str(item))
+                    else:
+                        skills_list.append(str(item))
+            elif isinstance(v, str):
+                skills_list += [x.strip() for x in v.split(",") if x.strip()]
+        if not skills_list:
+            # sometimes "edu" nested graph
+            g = jsonld.get("@graph")
+            if isinstance(g, list):
+                for gitem in g:
+                    if isinstance(gitem, dict) and gitem.get("keywords"):
+                        ks = gitem.get("keywords")
+                        if isinstance(ks, str):
+                            skills_list += [x.strip() for x in ks.split(",")]
+        skills = ", ".join(dict.fromkeys([s for s in skills_list if s]))  # uniq preserve order
+        level = jsonld.get("educationalLevel") or jsonld.get("audience") or ""
+    # Fallbacks:
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
+    if not description:
+        # large paragraph blocks: choose paragraph with >= 100 chars
+        paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        long_para = ""
+        for p in paras:
+            if len(p) >= 120:
+                long_para = p
+                break
+        description = long_para or (paras[0] if paras else "")
+    if not skills:
+        # try bullet lists around headings like "What you'll learn"
+        for header in soup.find_all(['h2','h3','h4','strong']):
+            txt = header.get_text().strip().lower()
+            if any(k in txt for k in ["what you'll learn","you will learn","learning outcomes","skills you'll gain","what you'll be able to do","what you'll learn"]):
+                ul = header.find_next_sibling("ul")
+                if ul:
+                    li_texts = [li.get_text(strip=True) for li in ul.find_all("li")]
+                    if li_texts:
+                        skills = ", ".join(li_texts)
+                        break
+        # generic fallback: collect first 6 list items on page
+        if not skills:
+            all_li = [li.get_text(strip=True) for li in soup.find_all("li")]
+            if all_li:
+                skills = ", ".join(all_li[:8])
+    if not level:
+        # search for occurrence of Beginner/Intermediate/Advanced in visible strings
+        for s in soup.strings:
+            st = s.strip()
+            if "beginner" in st.lower():
+                level = "Beginner"; break
+            if "intermediate" in st.lower():
+                level = "Intermediate"; break
+            if "advanced" in st.lower():
+                level = "Advanced"; break
+    # normalize
+    title = short_text(title, 300)
+    description = short_text(description, 400)
+    skills = short_text(skills, 400)
+    level = short_text(level, 80)
+    return title, description, skills, level
 
-def route_and_parse(url):
-    """
-    Decide which parser to use based on domain and run it.
-    Returns a dict with required fields.
-    """
-    parsed = urlparse(url)
-    netloc = parsed.netloc.lower()
-    try:
-        soup = get_soup(url)
-    except Exception as e:
-        print(f"Failed to fetch {url}: {e}")
-        return None
+# ---------------- MAIN FLOW ----------------
 
-    if "coursera.org" in netloc:
-        return parse_coursera(url, soup)
-    if "udemy.com" in netloc:
-        return parse_udemy(url, soup)
-    if "edx.org" in netloc:
-        return parse_edx(url, soup)
-    if "pluralsight.com" in netloc:
-        return parse_pluralsight(url, soup)
-    if "khanacademy.org" in netloc:
-        return parse_khanacademy(url, soup)
-    if "freecodecamp.org" in netloc:
-        return parse_freecodecamp(url, soup)
-    # generic fallback
-    return fallback_parser(url, soup)
-
-def is_listing_page(url, soup, domain):
-    """
-    Heuristic: if the page contains many links to course-like pages or contains words like 'courses' in URL/path/title.
-    """
-    path = urlparse(url).path.lower()
-    title = (soup.title.string or "").lower() if soup.title else ""
-    if "courses" in path or "courses" in title or "catalog" in path or "learn" in path:
-        return True
-    # also if there are many course-like <a> tags:
-    count = 0
-    for a in soup.find_all('a', href=True)[:200]:
-        href = a['href']
-        if any(k in href.lower() for k in ["course", "learn", "program", "specialization"]):
-            count += 1
-    return count >= 3
-
-def scrape_for_category(category_query):
-    """Perform one SerpAPI search, then scrape resulting URLs."""
-    site_filter = " OR ".join([f"site:{p}" for p in PLATFORMS])
-    query = f"{category_query} {site_filter}"
-    print(f"\nSearching SerpAPI for: {query}")
-    urls = serpapi_search(query, num_results=MAX_URLS_PER_SEARCH)
-    print(f"Found {len(urls)} URLs from SerpAPI (using up to {MAX_URLS_PER_SEARCH}).")
-    results = []
-    for u in urls:
-        time.sleep(PAGE_REQUEST_DELAY)
-        print(f"\nProcessing: {u}")
-        try:
-            soup = get_soup(u)
-        except Exception as e:
-            print(f"  Could not fetch {u}: {e}")
-            continue
-
-        domain = urlparse(u).netloc.lower()
-        # if listing page -> extract multiple course links
-        if is_listing_page(u, soup, domain):
-            print("  Detected listing page — extracting multiple course links...")
-            links = extract_course_links_from_listing(u, soup, domain)
-            print(f"  Found {len(links)} course links in listing (limiting to {MAX_COURSES_FROM_LISTING}).")
-            for link in links:
-                time.sleep(PAGE_REQUEST_DELAY)
-                parsed = route_and_parse(link)
-                if parsed:
-                    # add the category as an extra field
-                    parsed['category_query'] = category_query
-                    results.append(parsed)
-        else:
-            # single course page — parse directly
-            parsed = None
-            try:
-                parsed = route_and_parse(u)
-            except Exception as e:
-                print(f"  Error parsing {u}: {e}")
-            if parsed:
-                parsed['category_query'] = category_query
-                results.append(parsed)
-
-    return results
-
-# ---------------- RUNNER ----------------
-
-def main():
-    all_data = []
-    total_searches = 0
-
-    for cat in COURSE_CATEGORIES:
-        if total_searches >= len(COURSE_CATEGORIES):
-            # defensive: we plan 1 search per category
-            break
-        print(f"\n=== CATEGORY: {cat} ===")
-        cat_results = scrape_for_category(cat)
-        print(f"Collected {len(cat_results)} course items for category '{cat}'.")
-        all_data.extend(cat_results)
-        total_searches += 1
-        # small pause between SerpAPI searches (not strictly needed but polite)
-        time.sleep(1.0)
-
-    if not all_data:
-        print("No data scraped. Exiting.")
-        return
-
-    # normalize output fields and make DataFrame
+def run_many_to_many():
     rows = []
-    for item in all_data:
-        row = {
-            "course_name": item.get("course_name", "Not available"),
-            "platform": item.get("platform", "Not available"),
-            "url": item.get("url", "Not available"),
-            "duration": item.get("duration", "Not available"),
-            "rating": item.get("rating", "Not available"),
-            "skill_level": item.get("skill_level", "Not available"),
-            "short_description": item.get("short_description", "Not available"),
-            "price": item.get("price", "Not available"),
-            "skills_covered": item.get("skills_covered", "Not available"),
-            "category_query": item.get("category_query", "Not available")
-        }
-        rows.append(row)
+    planned_searches = len(PLATFORMS) * len(CATEGORIES)
+    used_searches = 0
+    print(f"Planned {planned_searches} SerpAPI searches (platform × categories). Each will request up to {MAX_URLS_PER_SEARCH} results.")
+    for platform in PLATFORMS:
+        pname = PLATFORM_NAME_MAP.get(platform, platform)
+        for category in CATEGORIES:
+            used_searches += 1
+            q = f'{category} site:{platform}'
+            print(f"\n[{used_searches}/{planned_searches}] SerpAPI: {pname} <{category}>")
+            res = serpapi_search(q, num_results=MAX_URLS_PER_SEARCH)
+            time.sleep(SERPAPI_DELAY)
 
-    df = pd.DataFrame(rows)
-    df.to_excel(OUTPUT_XLSX, index=False)
-    print(f"\nScraping complete. Saved {len(df)} rows to '{OUTPUT_XLSX}'.")
+            for hit in res:
+                link = hit.get("link") or hit.get("url") or hit.get("displayed_link") or ""
+                if not link:
+                    continue
+                # normalize link
+                link = link.split("#")[0].split("?")[0]
+
+                # Fetch page (no strict filter — we will be lenient)
+                print("  -> fetching:", link)
+                try:
+                    html = get_html_safe(link)
+                except Exception as e:
+                    print("    fetch failed:", e)
+                    continue
+                if not html:
+                    print("    empty fetch, skipping")
+                    continue
+                soup = BeautifulSoup(html, "html.parser")
+
+                # if listing page -> extract multiple course links and scrape each
+                if is_listing_page(link, soup):
+                    print("    detected listing page, extracting multiple course links...")
+                    links = extract_links_from_listing(link, soup, platform)
+                    print(f"    extracted {len(links)} links from listing")
+                    for course_link in links:
+                        time.sleep(PAGE_REQUEST_DELAY)
+                        try:
+                            html2 = get_html_safe(course_link)
+                        except Exception:
+                            continue
+                        if not html2:
+                            continue
+                        soup2 = BeautifulSoup(html2, "html.parser")
+                        title, desc, skills, level = extract_course_info_lenient(course_link, soup2, platform)
+                        # accept even when one of title/desc exists
+                        if not title and not desc:
+                            print("      skipping extracted link: no title/desc")
+                            continue
+                        rows.append({
+                            "course_title": title,
+                            "short_description": desc,
+                            "skills": skills,
+                            "URL": course_link,
+                            "course_level": level,
+                            "platform": pname,
+                            "category_query": category
+                        })
+                else:
+                    # single page: parse directly leniently
+                    title, desc, skills, level = extract_course_info_lenient(link, soup, platform)
+                    if not title and not desc:
+                        print("    skipping: no title/desc found on single page")
+                        continue
+                    rows.append({
+                        "course_title": title,
+                        "short_description": desc,
+                        "skills": skills,
+                        "URL": link,
+                        "course_level": level,
+                        "platform": pname,
+                        "category_query": category
+                    })
+                # short pause to be polite
+                time.sleep(PAGE_REQUEST_DELAY)
+    return rows
+
+# helper get_html_safe with retries:
+def get_html_safe(url):
+    headers = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    tries = 2
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            time.sleep(1 + i)
+    return None
+
+# ---------------- SAVE ----------------
+
+def save_to_excel(rows, filename=OUTPUT_XLSX):
+    df = pd.DataFrame(rows, columns=["course_title","short_description","skills","URL","course_level","platform","category_query"])
+    if df.empty:
+        print("No rows to save.")
+        return
+    try:
+        df.to_excel(filename, index=False)
+        print(f"Saved {len(df)} rows to {filename}")
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback = f"courses_data_{ts}.xlsx"
+        df.to_excel(fallback, index=False)
+        print(f"Permission denied for {filename}. Saved to {fallback} ({len(df)} rows).")
+
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    main()
+    if not API_KEY or API_KEY.strip().startswith("YOUR"):
+        print("ERROR: Put your SerpAPI key into API_KEY variable in the script before running.")
+    else:
+        rows = run_many_to_many()
+        save_to_excel(rows)
